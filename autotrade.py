@@ -102,12 +102,16 @@ def generate_reflection(trades_df, current_market_data):
         return None
     
     # OpenAI API 호출로 AI의 반성 일기 및 개선 사항 생성 요청
+def generate_reflection(trades_df, current_market_data):
+    performance = calculate_performance(trades_df)
+    
+    client = OpenAI()
     response = client.chat.completions.create(
         model="gpt-4o-2024-08-06",
         messages=[
             {
                 "role": "system",
-                "content": "You are an AI trading assistant tasked with analyzing recent trading performance and current market conditions to generate insights and improvements for future trading decisions."
+                "content": "You are an AI trading assistant tasked with analyzing recent trading performance and current market conditions to generate insights, probabilities, and improvements for future trading decisions."
             },
             {
                 "role": "user",
@@ -121,16 +125,19 @@ def generate_reflection(trades_df, current_market_data):
                 Overall performance in the last 7 days: {performance:.2f}%
                 
                 Please analyze this data and provide:
-                1. A brief reflection on the recent trading decisions
-                2. Insights on what worked well and what didn't
-                3. Suggestions for improvement in future trading decisions
-                4. Any patterns or trends you notice in the market data
-                
+                1. A brief reflection on the recent trading decisions.
+                2. Probabilities for price movement:
+                   - Probability of price increasing in the next 24 hours (%).
+                   - Probability of price decreasing in the next 24 hours (%).
+                3. Suggested decision (buy, sell, or hold) and percentage with reasoning.
+
+                Ensure your response includes the probabilities as part of your reasoning and decision-making.
                 Limit your response to 250 words or less.
                 """
             }
         ]
     )
+
 
     try:
         response_content = response.choices[0].message.content
@@ -414,6 +421,8 @@ def ai_trading():
                         If the decision is 'sell', provide a percentage (1-100) of held BTC to sell.
                         If the decision is 'hold', set the percentage to 0.
                         3. Reason for your decision
+                        4. Probability of price increase (%)
+                        5. Probability of price decrease (%)
 
                         Ensure that the percentage is an integer between 1 and 100 for buy/sell decisions, and exactly 0 for hold decisions.
                         Your percentage should reflect the strength of your conviction in the decision based on the analyzed data."""
@@ -449,9 +458,11 @@ def ai_trading():
                             "properties": {
                                 "decision": {"type": "string", "enum": ["buy", "sell", "hold"]},
                                 "percentage": {"type": "integer"},
-                                "reason": {"type": "string"}
+                                "reason": {"type": "string"},
+                                "probability_increase": {"type": "integer"},
+                                "probability_decrease": {"type": "integer"}
                             },
-                            "required": ["decision", "percentage", "reason"],
+                            "required": ["decision", "percentage", "reason", "probability_increase", "probability_decrease"],
                             "additionalProperties": False
                         }
                     }
@@ -459,15 +470,21 @@ def ai_trading():
                 max_tokens=4095
             )
 
+
             # Pydantic을 사용하여 AI의 트레이딩 결정 구조를 정의
             try:
                 result = TradingDecision.model_validate_json(response.choices[0].message.content)
+                response_data = json.loads(response.choices[0].message.content)
+                probability_increase = response_data.get("probability_increase", 0)
+                probability_decrease = response_data.get("probability_decrease", 0)
             except Exception as e:
                 logger.error(f"Error parsing AI response: {e}")
                 return
             
             logger.info(f"AI Decision: {result.decision.upper()}")
             logger.info(f"Decision Reason: {result.reason}")
+            logger.info(f"Probability of Increase: {probability_increase}% ")
+            logger.info(f"Probability of Decrease: {probability_decrease}% ")
 
             order_executed = False
 
@@ -551,7 +568,7 @@ if __name__ == "__main__":
 
     ## 매일 특정 시간(예: 오전 9시, 오후 3시, 오후 9시)에 실행
     schedule.every().day.at("09:00").do(job)
-    schedule.every().day.at("15:00").do(job)
+    schedule.every().day.at("14:30").do(job)
     schedule.every().day.at("21:00").do(job)
     while True:
         schedule.run_pending()
