@@ -107,7 +107,7 @@ def generate_reflection(trades_df, current_market_data):
     
     client = OpenAI()
     response = client.chat.completions.create(
-        model="gpt-4o-2024-08-06",
+        model="gpt-4o-mini",
         messages=[
             {
                 "role": "system",
@@ -314,9 +314,24 @@ def capture_and_encode_screenshot(driver):
         logger.error(f"스크린샷 캡처 및 인코딩 중 오류 발생: {e}")
         return None
 
+
+def save_results_to_txt(probability_increase, pred_now, current_price, file_path="prediction_results.txt"):
+    try:
+        with open(file_path, "a", encoding="utf-8") as file:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")  # 현재 시간
+            file.write(f"Timestamp: {timestamp}\n")
+            file.write(f"Probability of Increase: {probability_increase}%\n")
+            file.write(f"Predicted Increase by LSTM: {pred_now}%\n")
+            file.write(f"Current Bitcoin Price: {current_price} KRW\n")
+            file.write("-" * 50 + "\n")  # 구분선
+        logger.info("Prediction results saved to TXT file successfully.")
+    except Exception as e:
+        logger.error(f"Error saving prediction results to TXT file: {e}")
+
 ### 메인 AI 트레이딩 로직
 def ai_trading():
     global upbit
+    
     ### 데이터 가져오기
     # 1. 현재 투자 상태 조회
     all_balances = upbit.get_balances()
@@ -393,7 +408,7 @@ def ai_trading():
             
             # AI 모델에 반성 내용 제공
             response = client.chat.completions.create(
-                model="gpt-4o-2024-08-06",
+                model="gpt-4o-mini",
                 messages=[
                     {
                         "role": "system",
@@ -488,56 +503,208 @@ def ai_trading():
 
             order_executed = False
 
-            if result.decision == "buy":
+            pd.options.display.float_format = '{:.6f}'.format
+            import numpy as np
+            import tensorflow as tf
+            from sklearn.preprocessing import StandardScaler
+            # 모델 로드는 전역으로 한 번만 수행
+            model = tf.keras.models.load_model('lstm_final.h5')
+
+            # 예측 함수를 tf.function으로 최적화
+            @tf.function(reduce_retracing=True)
+            def predict_step(x):
+                return model(x, training=False)
+
+            def expand_orderbook_units(row, max_units=15):
+                new_columns = {}
+                for i in range(max_units):
+                    try:
+                        unit = row['orderbook_units'][i]
+                        new_columns[f'{i+1}_ask_price'] = unit['ask_price']
+                        new_columns[f'{i+1}_bid_price'] = unit['bid_price']
+                        new_columns[f'{i+1}_ask_size'] = unit['ask_size']
+                        new_columns[f'{i+1}_bid_size'] = unit['bid_size']
+                    except IndexError:
+                        new_columns[f'{i+1}_ask_price'] = None
+                        new_columns[f'{i+1}_bid_price'] = None
+                        new_columns[f'{i+1}_ask_size'] = None
+                        new_columns[f'{i+1}_bid_size'] = None
+                return pd.Series(new_columns)
+
+            def preprocessing_and_predict():
+                orderbook_data = []
+                current_prices = []
+                required_size = 20
+                sequence_length = 20
+                max_attempts = 300
+                attempts = 0
+            
+                try:
+                    while len(orderbook_data) < required_size and attempts < max_attempts:
+                        attempts += 1
+                    
+                        orderbook = pyupbit.get_orderbook("KRW-BTC")
+                    
+                        if orderbook:
+                            current_price = orderbook['orderbook_units'][0]['ask_price']
+                            current_prices.append(current_price)
+                        
+                            total_ask = sum(unit['ask_size'] for unit in orderbook['orderbook_units'])
+                            total_bid = sum(unit['bid_size'] for unit in orderbook['orderbook_units'])
+                        
+                            orderbook_data.append({
+                                'timestamp': int(time.time()),
+                                'orderbook': orderbook,
+                                'total_ask_size': total_ask,
+                                'total_bid_size': total_bid,
+                                'trade_volume': total_ask + total_bid
+                            })
+                    
+                        time.sleep(0.1)
+                    
+                        if len(orderbook_data) % 5 == 0:
+                            print(f"Collected {len(orderbook_data)}/{required_size} samples...")
+                
+                    if len(orderbook_data) < required_size:
+                        print(f"Warning: Could not collect {required_size} samples. Collected {len(orderbook_data)} samples.")
+                        if len(orderbook_data) == 0:
+                            return None
+                    else:
+                        print(f"Successfully collected {required_size} samples!")
+                    
+                    df = pd.DataFrame(orderbook_data)
+                    expanded = pd.concat([df['timestamp'], 
+                                        df['orderbook'].apply(expand_orderbook_units)], axis=1)
+                
+                    expanded['trade_price'] = current_prices
+                    expanded['trade_volume'] = df['trade_volume']
+                    expanded['total_ask_size'] = df['total_ask_size']
+                    expanded['total_bid_size'] = df['total_bid_size']
+                
+                    expanded['spread'] = expanded[[f'{i+1}_ask_price' for i in range(5)]].min(axis=1) - expanded[[f'{i+1}_bid_price' for i in range(5)]].max(axis=1)
+                    expanded['imbalance'] = (expanded['total_bid_size'] - expanded['total_ask_size']) / (expanded['total_bid_size'] + expanded['total_ask_size'])
+                    expanded['totalSize_ratio'] = expanded['total_bid_size'] / expanded['total_ask_size']
+                
+                    cols_to_keep = ['timestamp', 'total_ask_size', 'total_bid_size', 
+                                    '1_ask_size', '1_bid_size', '2_ask_size', '2_bid_size', '3_ask_size', '3_bid_size',
+                                    '4_ask_size', '4_bid_size', '5_ask_size', '5_bid_size',
+                                    'trade_price', 'trade_volume', 'spread', 'imbalance', 'totalSize_ratio']
+                
+                    df = expanded[cols_to_keep]
+                
+                    X = df.values
+                
+                    scaler = StandardScaler()
+                    X_scaled = scaler.fit_transform(X)
+                
+                    sequences = []
+                    for i in range(len(X_scaled) - sequence_length + 1):
+                        sequences.append(X_scaled[i:i + sequence_length])
+                
+                    X_sequence = np.array(sequences)[-1:]
+                
+                    # numpy array를 tensorflow tensor로 변환
+                    X_tensor = tf.convert_to_tensor(X_sequence, dtype=tf.float32)
+                
+                    # 최적화된 예측 함수 사용
+                    pred = predict_step(X_tensor)
+                
+                    return float(pred[0][0])  # tensor를 python float로 변환
+                
+                except Exception as e:
+                    print(f"Error during data collection: {e}")
+                    return None
+            pred_now = preprocessing_and_predict()
+
+            current_price = pyupbit.get_current_price("KRW-BTC")
+            print(f"### Current Bitcoin Price: {current_price} KRW ###")
+            
+            print(f"### Probability of Increase: {probability_increase}% ###")
+            print(f"### Probability of Increase: {pred_now}% ###")
+            save_results_to_txt(probability_increase, pred_now, current_price)  # 새로 추가된 부분
+            probability_increase = probability_increase *0.01
+
+            decision_value = probability_increase * 0.3 + pred_now * 0.7
+
+            def calculate_percentage(decision_value, min_value, max_value):
+                if decision_value >= 0.6:
+                    percentage = min_value + (max_value - min_value) * ((decision_value - 0.6) / 0.4)
+                    return percentage
+                elif decision_value <= 0.4:
+                    percentage = min_value + (max_value - min_value) * ((0.4 - decision_value) / 0.4)
+                    return percentage
+                else:
+                    return 0
+ 
+            # 매매 결정 및 실행
+            if decision_value > 0.6:
+                decision = "buy"
+                percentage = calculate_percentage(decision_value, 0.3,0.5)
+                percentage = percentage *100
+            elif decision_value < 0.4:
+                decision = "sell"
+                percentage = calculate_percentage(decision_value, 0.3, 0.5)
+                percentage = percentage *100
+            else:
+                decision = "hold"
+                percentage = 0
+
+            logger.info(f"Decision: {decision.upper()}, Percentage: {percentage}%")
+
+            order_executed = False
+            if decision == "buy":
                 my_krw = upbit.get_balance("KRW")
                 if my_krw is None:
                     logger.error("Failed to retrieve KRW balance.")
-                    return
-                buy_amount = my_krw * (result.percentage / 100) * 0.9995  # 수수료 고려
-                if buy_amount > 5000:
-                    logger.info(f"Buy Order Executed: {result.percentage}% of available KRW")
-                    try:
-                        order = upbit.buy_market_order("KRW-BTC", buy_amount)
-                        if order:
-                            logger.info(f"Buy order executed successfully: {order}")
-                            order_executed = True
-                        else:
-                            logger.error("Buy order failed.")
-                    except Exception as e:
-                        logger.error(f"Error executing buy order: {e}")
                 else:
-                    logger.warning("Buy Order Failed: Insufficient KRW (less than 5000 KRW)")
-            elif result.decision == "sell":
+                    buy_amount = my_krw * (percentage / 100) * 0.9995  # 수수료 고려
+                    if buy_amount > 5000:
+                        logger.info(f"Buy Order Executed: {percentage}% of available KRW")
+                        try:
+                            order = upbit.buy_market_order("KRW-BTC", buy_amount)
+                            if order:
+                                logger.info(f"Buy order executed successfully: {order}")
+                                order_executed = True
+                            else:
+                                logger.error("Buy order failed.")
+                        except Exception as e:
+                            logger.error(f"Error executing buy order: {e}")
+                    else:
+                        logger.warning("Buy Order Failed: Insufficient KRW (less than 5000 KRW)")
+
+            elif decision == "sell":
                 my_btc = upbit.get_balance("KRW-BTC")
                 if my_btc is None:
-                    logger.error("Failed to retrieve KRW balance.")
-                    return
-                sell_amount = my_btc * (result.percentage / 100)
-                current_price = pyupbit.get_current_price("KRW-BTC")
-                if sell_amount * current_price > 5000:
-                    logger.info(f"Sell Order Executed: {result.percentage}% of held BTC")
-                    try:
-                        order = upbit.sell_market_order("KRW-BTC", sell_amount)
-                        if order:
-                            order_executed = True
-                        else:
-                            logger.error("Buy order failed.")
-                    except Exception as e:
-                        logger.error(f"Error executing sell order: {e}")
+                    logger.error("Failed to retrieve BTC balance.")
                 else:
-                    logger.warning("Sell Order Failed: Insufficient BTC (less than 5000 KRW worth)")
+                    sell_amount = my_btc * (percentage / 100)
+                    current_price = pyupbit.get_current_price("KRW-BTC")
+                    if sell_amount * current_price > 5000:
+                        logger.info(f"Sell Order Executed: {percentage}% of held BTC")
+                        try:
+                            order = upbit.sell_market_order("KRW-BTC", sell_amount)
+                            if order:
+                                logger.info(f"Sell order executed successfully: {order}")
+                                order_executed = True
+                            else:
+                                logger.error("Sell order failed.")
+                        except Exception as e:
+                            logger.error(f"Error executing sell order: {e}")
+                    else:
+                        logger.warning("Sell Order Failed: Insufficient BTC (less than 5000 KRW worth)")
+
             
-            # 거래 실행 여부와 관계없이 현재 잔고 조회
-            time.sleep(2)  # API 호출 제한을 고려하여 잠시 대기
+            # 거래 기록 저장
+            time.sleep(2)  # API 호출 제한 고려
             balances = upbit.get_balances()
             btc_balance = next((float(balance['balance']) for balance in balances if balance['currency'] == 'BTC'), 0)
             krw_balance = next((float(balance['balance']) for balance in balances if balance['currency'] == 'KRW'), 0)
             btc_avg_buy_price = next((float(balance['avg_buy_price']) for balance in balances if balance['currency'] == 'BTC'), 0)
             current_btc_price = pyupbit.get_current_price("KRW-BTC")
 
-            # 거래 기록을 DB에 저장하기
-            log_trade(conn, result.decision, result.percentage if order_executed else 0, result.reason, 
-                    btc_balance, krw_balance, btc_avg_buy_price, current_btc_price, reflection)
+            log_trade(conn, decision, percentage if order_executed else 0, 
+                    f"Decision based on value: {decision_value:.2f}", 
+                    btc_balance, krw_balance, btc_avg_buy_price, current_btc_price)   
     except sqlite3.Error as e:
         logger.error(f"Database connection error: {e}")
         return
@@ -567,9 +734,151 @@ if __name__ == "__main__":
     # job()
 
     ## 매일 특정 시간(예: 오전 9시, 오후 3시, 오후 9시)에 실행
+    
     schedule.every().day.at("09:00").do(job)
+    schedule.every().day.at("09:10").do(job)
+    schedule.every().day.at("09:20").do(job)
+    schedule.every().day.at("09:30").do(job)
+    schedule.every().day.at("09:40").do(job)
+    schedule.every().day.at("09:50").do(job)
+    schedule.every().day.at("10:00").do(job)
+    schedule.every().day.at("10:10").do(job)
+    schedule.every().day.at("10:20").do(job)
+    schedule.every().day.at("10:30").do(job)
+    schedule.every().day.at("10:40").do(job)
+    schedule.every().day.at("10:50").do(job)
+    schedule.every().day.at("11:00").do(job)
+    schedule.every().day.at("11:10").do(job)
+    schedule.every().day.at("11:20").do(job)
+    schedule.every().day.at("11:30").do(job)
+    schedule.every().day.at("11:40").do(job)
+    schedule.every().day.at("11:50").do(job)
+    schedule.every().day.at("12:00").do(job)
+    schedule.every().day.at("12:10").do(job)
+    schedule.every().day.at("12:20").do(job)
+    schedule.every().day.at("12:30").do(job)
+    schedule.every().day.at("12:40").do(job)
+    schedule.every().day.at("12:50").do(job)
+    schedule.every().day.at("13:00").do(job)
+    schedule.every().day.at("13:10").do(job)
+    schedule.every().day.at("13:20").do(job)
+    schedule.every().day.at("13:30").do(job)
+    schedule.every().day.at("13:40").do(job)
+    schedule.every().day.at("13:50").do(job)
+    schedule.every().day.at("14:00").do(job)
+    schedule.every().day.at("14:10").do(job)
+    schedule.every().day.at("14:20").do(job)
     schedule.every().day.at("14:30").do(job)
+    schedule.every().day.at("14:40").do(job)
+    schedule.every().day.at("14:50").do(job)
+    schedule.every().day.at("15:00").do(job)
+    schedule.every().day.at("15:10").do(job)
+    schedule.every().day.at("15:20").do(job)
+    schedule.every().day.at("15:30").do(job)
+    schedule.every().day.at("15:40").do(job)
+    schedule.every().day.at("15:50").do(job)
+    schedule.every().day.at("16:00").do(job)
+    schedule.every().day.at("16:10").do(job)
+    schedule.every().day.at("16:20").do(job)
+    schedule.every().day.at("16:30").do(job)
+    schedule.every().day.at("16:40").do(job)
+    schedule.every().day.at("16:50").do(job)
+    schedule.every().day.at("17:00").do(job)
+    schedule.every().day.at("17:10").do(job)
+    schedule.every().day.at("17:20").do(job)
+    schedule.every().day.at("17:30").do(job)
+    schedule.every().day.at("17:40").do(job)
+    schedule.every().day.at("17:50").do(job)
+    schedule.every().day.at("18:00").do(job)
+    schedule.every().day.at("18:10").do(job)
+    schedule.every().day.at("18:20").do(job)
+    schedule.every().day.at("18:30").do(job)
+    schedule.every().day.at("18:40").do(job)
+    schedule.every().day.at("18:50").do(job)
+    schedule.every().day.at("19:00").do(job)
+    schedule.every().day.at("19:10").do(job)
+    schedule.every().day.at("19:20").do(job)
+    schedule.every().day.at("19:30").do(job)
+    schedule.every().day.at("19:40").do(job)
+    schedule.every().day.at("19:50").do(job)
+    schedule.every().day.at("20:00").do(job)
+    schedule.every().day.at("20:10").do(job)
+    schedule.every().day.at("20:20").do(job)
+    schedule.every().day.at("20:30").do(job)
+    schedule.every().day.at("20:40").do(job)
+    schedule.every().day.at("20:50").do(job)
     schedule.every().day.at("21:00").do(job)
+    schedule.every().day.at("21:10").do(job)
+    schedule.every().day.at("21:20").do(job)
+    schedule.every().day.at("21:30").do(job)
+    schedule.every().day.at("21:40").do(job)
+    schedule.every().day.at("21:50").do(job)
+    schedule.every().day.at("22:00").do(job)
+    schedule.every().day.at("22:10").do(job)
+    schedule.every().day.at("22:20").do(job)
+    schedule.every().day.at("22:30").do(job)
+    schedule.every().day.at("22:40").do(job)
+    schedule.every().day.at("22:50").do(job)
+    schedule.every().day.at("23:00").do(job)
+    schedule.every().day.at("23:10").do(job)
+    schedule.every().day.at("23:20").do(job)
+    schedule.every().day.at("23:30").do(job)
+    schedule.every().day.at("23:40").do(job)
+    schedule.every().day.at("23:50").do(job)
+    schedule.every().day.at("00:00").do(job)
+    schedule.every().day.at("00:10").do(job)
+    schedule.every().day.at("00:20").do(job)
+    schedule.every().day.at("00:30").do(job)
+    schedule.every().day.at("00:40").do(job)
+    schedule.every().day.at("00:50").do(job)
+    schedule.every().day.at("01:00").do(job)
+    schedule.every().day.at("01:10").do(job)
+    schedule.every().day.at("01:20").do(job)
+    schedule.every().day.at("01:30").do(job)
+    schedule.every().day.at("01:40").do(job)
+    schedule.every().day.at("01:50").do(job)
+    schedule.every().day.at("02:00").do(job)
+    schedule.every().day.at("02:10").do(job)
+    schedule.every().day.at("02:20").do(job)
+    schedule.every().day.at("02:30").do(job)
+    schedule.every().day.at("02:40").do(job)
+    schedule.every().day.at("02:50").do(job)
+    schedule.every().day.at("03:00").do(job)
+    schedule.every().day.at("03:10").do(job)
+    schedule.every().day.at("03:20").do(job)
+    schedule.every().day.at("03:30").do(job)
+    schedule.every().day.at("03:40").do(job)
+    schedule.every().day.at("03:50").do(job)
+    schedule.every().day.at("04:00").do(job)
+    schedule.every().day.at("04:10").do(job)
+    schedule.every().day.at("04:20").do(job)
+    schedule.every().day.at("04:30").do(job)
+    schedule.every().day.at("04:40").do(job)
+    schedule.every().day.at("04:50").do(job)
+    schedule.every().day.at("05:00").do(job)
+    schedule.every().day.at("05:10").do(job)
+    schedule.every().day.at("05:20").do(job)
+    schedule.every().day.at("05:30").do(job)
+    schedule.every().day.at("05:40").do(job)
+    schedule.every().day.at("05:50").do(job)
+    schedule.every().day.at("06:00").do(job)
+    schedule.every().day.at("06:10").do(job)
+    schedule.every().day.at("06:20").do(job)
+    schedule.every().day.at("06:30").do(job)
+    schedule.every().day.at("06:40").do(job)
+    schedule.every().day.at("06:50").do(job)
+    schedule.every().day.at("07:00").do(job)
+    schedule.every().day.at("07:10").do(job)
+    schedule.every().day.at("07:20").do(job)
+    schedule.every().day.at("07:30").do(job)
+    schedule.every().day.at("07:40").do(job)
+    schedule.every().day.at("07:50").do(job)
+    schedule.every().day.at("08:00").do(job)
+    schedule.every().day.at("08:10").do(job)
+    schedule.every().day.at("08:20").do(job)
+    schedule.every().day.at("08:30").do(job)
+    schedule.every().day.at("08:40").do(job)
+    schedule.every().day.at("08:50").do(job)    
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+         schedule.run_pending()
+         time.sleep(1)
